@@ -430,10 +430,9 @@ func httpClientWithProxy(agent *FallbackAgent) *http.Client {
 		if err != nil {
 			return nil, fmt.Errorf("can't prepare underlying connection for TLS session: %w", err)
 		}
-		var cfg tls.Config
-		if tlsConfig != nil {
-			cfg = *tlsConfig
-		}
+		// tlsConfig only ever carries a custom RootCAs pool; copying the
+		// whole struct would also copy its embedded mutex.
+		cfg := tls.Config{RootCAs: rootCAs}
 		if !hideSNI {
 			cfg.ServerName = host
 		} else {
