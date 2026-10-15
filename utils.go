@@ -3,8 +3,11 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/csv"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -22,9 +25,10 @@ import (
 const COPY_BUF = 128 * 1024
 
 type Endpoint struct {
-	Host    string
-	Port    uint16
-	TLSName string
+	Host     string
+	Port     uint16
+	TLSName  string
+	ExpectIP string
 }
 
 func (e *Endpoint) URL() *url.URL {
@@ -239,6 +243,49 @@ func get_endpoint(tunnels *ZGetTunnelsResponse, typ string, trial bool, force_po
 		Port:    port,
 		TLSName: hostname,
 	}, nil
+}
+
+// checkEndpoint verifies a tunnel endpoint end-to-end: it CONNECTs through
+// the zagent with the real proxy credentials and fetches checkURL, which is
+// expected to return a JSON document carrying an "ip" field. The returned
+// egress IP is compared against the advertised ip_list entry so dead exits
+// and tampered responses are both detected before the proxy starts serving.
+func checkEndpoint(ctx context.Context, ep *Endpoint, auth AuthProvider, checkURL string, timeout time.Duration, caPool *x509.CertPool, nextDialer ContextDialer) (string, error) {
+	dialer := NewProxyDialer(ep.NetAddr(), ep.TLSName, caPool, auth, hideSNI, nextDialer)
+	// Use the custom CA pool for the end-to-end TLS handshake so -cafile is
+	// honored here as well.
+	tr := &http.Transport{
+		DialContext:     dialer.DialContext,
+		TLSClientConfig: &tls.Config{RootCAs: caPool},
+	}
+	defer tr.CloseIdleConnections()
+	client := &http.Client{Transport: tr, Timeout: timeout}
+	req, err := http.NewRequestWithContext(ctx, "GET", checkURL, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("User-Agent", userAgent)
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("check request returned status %d", resp.StatusCode)
+	}
+	var res struct {
+		IP string `json:"ip"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
+		return "", fmt.Errorf("unable to parse check response: %w", err)
+	}
+	if res.IP == "" {
+		return "", errors.New("check response carries no ip field")
+	}
+	if ep.ExpectIP != "" && res.IP != ep.ExpectIP {
+		return "", fmt.Errorf("egress IP %s does not match advertised %s", res.IP, ep.ExpectIP)
+	}
+	return res.IP, nil
 }
 
 // Hop-by-hop headers. These are removed when sent to the backend.

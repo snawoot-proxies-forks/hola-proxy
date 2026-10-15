@@ -103,6 +103,8 @@ type CLIArgs struct {
 	initRetryInterval                       time.Duration
 	hideSNI                                 bool
 	userAgent                               *string
+	check                                   bool
+	checkURL                                string
 }
 
 func parse_args() *CLIArgs {
@@ -156,6 +158,10 @@ func parse_args() *CLIArgs {
 			return nil
 		})
 	flag.BoolVar(&args.hideSNI, "hide-SNI", true, "hide SNI in TLS sessions with proxy server")
+	flag.BoolVar(&args.check, "check", false, "verify tunnel endpoint end-to-end before "+
+		"starting the proxy server")
+	flag.StringVar(&args.checkURL, "check-url", "https://checkip.greensec.de/json",
+		"URL to fetch through the tunnel for -check. Expected to return JSON with an \"ip\" field")
 	flag.Parse()
 	if args.country == "" {
 		arg_fail("Country can't be empty string.")
@@ -319,6 +325,17 @@ func run() int {
 	if err != nil {
 		mainLogger.Critical("Unable to determine proxy endpoint: %v", err)
 		return 5
+	}
+	endpoint.ExpectIP = tunnels.IPList[endpoint.TLSName]
+	if args.check {
+		checkCtx, cancel := context.WithTimeout(context.Background(), args.timeout)
+		ip, cerr := checkEndpoint(checkCtx, endpoint, auth, args.checkURL, args.timeout, caPool, dialer)
+		cancel()
+		if cerr != nil {
+			mainLogger.Critical("Endpoint check failed: %v", cerr)
+			return 5
+		}
+		mainLogger.Info("Endpoint verified, egress IP: %s", ip)
 	}
 	handlerDialer := NewProxyDialer(endpoint.NetAddr(), endpoint.TLSName, caPool, auth, args.hideSNI, dialer)
 	requestDialer := NewPlaintextDialer(endpoint.NetAddr(), endpoint.TLSName, caPool, args.hideSNI, dialer)

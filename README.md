@@ -124,6 +124,8 @@ zagent248.hola.org,165.22.65.3,22222,22223,22224,22225,22226,digitalocean
 | backoff-initial | Duration | initial average backoff delay for zgettunnels (randomized by +/-50%) (default 3s) |
 | bind-address | String | HTTP proxy address to listen to (default "127.0.0.1:8080") |
 | cafile | String | use custom CA certificate bundle file |
+| check | - | verify tunnel endpoint end-to-end before starting the proxy server |
+| check-url | String | URL to fetch through the tunnel for -check. Expected to return JSON with an `ip` field (default "https://checkip.greensec.de/json") |
 | country | String | desired proxy location (default "us") |
 | dont-use-trial | - | use regular ports instead of trial ports |
 | ext-ver | String | extension version to mimic in requests. Can be obtained from https://chrome.google.com/webstore/detail/hola-vpn-the-website-unbl/gkojfkhlekighikafcpjkiklfbnlmeio (default "999.999.999") |
