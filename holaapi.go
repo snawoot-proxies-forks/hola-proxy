@@ -14,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -30,6 +31,7 @@ const EXT_BROWSER = "chrome"
 const PRODUCT = "cws"
 const CCGI_URL = "https://client.hola.org/client_cgi/"
 const VPN_COUNTRIES_URL = CCGI_URL + "vpn_countries.json"
+const RULES_GET_VPN_URL = CCGI_URL + "rules_get_vpn.json"
 const BG_INIT_URL = CCGI_URL + "background_init"
 const ZGETTUNNELS_URL = CCGI_URL + "zgettunnels"
 const AGENT_SUFFIX = ".hola.org"
@@ -230,6 +232,28 @@ func background_init(ctx context.Context, client *http.Client, extVer, user_uuid
 	return
 }
 
+// validateSession checks a stored session against rules_get_vpn. The
+// endpoint returns {"blocked": true} for invalid or banned sessions.
+func validateSession(ctx context.Context, client *http.Client, extVer, user_uuid string, session_key int64) (bool, error) {
+	params := make(url.Values)
+	params.Add("uuid", user_uuid)
+	params.Add("session_key", strconv.FormatInt(session_key, 10))
+	params.Add("ext_ver", extVer)
+	params.Add("browser", EXT_BROWSER)
+	params.Add("product", PRODUCT)
+	data, err := do_req(ctx, client, "", RULES_GET_VPN_URL, params, nil)
+	if err != nil {
+		return false, err
+	}
+	var obj struct {
+		Blocked bool `json:"blocked"`
+	}
+	if err := json.Unmarshal(data, &obj); err != nil {
+		return false, fmt.Errorf("unable to parse rules_get_vpn response: %w", err)
+	}
+	return !obj.Blocked, nil
+}
+
 func zgettunnels(ctx context.Context,
 	client *http.Client,
 	user_uuid string,
@@ -348,15 +372,52 @@ func Tunnels(ctx context.Context,
 	timeout time.Duration,
 	backoffInitial time.Duration,
 	backoffDeadline time.Duration,
+	sessionFile string,
 ) (res *ZGetTunnelsResponse, user_uuid string, reterr error) {
-	u := uuid.New()
-	user_uuid = hex.EncodeToString(u[:])
-	ctx1, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-	initres, err := background_init(ctx1, client, extVer, user_uuid)
+	var sessionKey int64
+	// reused tracks whether credentials came from the session file (rather
+	// than a fresh background_init), so a stale stored session can be
+	// re-registered once if zgettunnels rejects it.
+	reused := false
+	sess, err := loadSession(sessionFile)
 	if err != nil {
-		reterr = err
-		return
+		logger.Warning("Could not load session file %s: %v", sessionFile, err)
+	}
+	if sess != nil {
+		ctx1, cancel := context.WithTimeout(ctx, timeout)
+		valid, verr := validateSession(ctx1, client, extVer, sess.UUID, sess.SessionKey)
+		cancel()
+		switch {
+		case verr != nil:
+			// A transient validation error must not cost a rate-limited
+			// registration - reuse the stored session optimistically and
+			// let zgettunnels arbitrate.
+			user_uuid, sessionKey = sess.UUID, sess.SessionKey
+			reused = true
+			logger.Warning("Session validation failed (%v); reusing stored session optimistically", verr)
+		case valid:
+			user_uuid, sessionKey = sess.UUID, sess.SessionKey
+			reused = true
+			logger.Info("Reusing session from %s", sessionFile)
+		default:
+			logger.Warning("Stored session was rejected, registering a new one")
+		}
+	}
+	if user_uuid == "" {
+		u := uuid.New()
+		user_uuid = hex.EncodeToString(u[:])
+		ctx1, cancel := context.WithTimeout(ctx, timeout)
+		initres, err := background_init(ctx1, client, extVer, user_uuid)
+		cancel()
+		if err != nil {
+			reterr = err
+			return
+		}
+		sessionKey = initres.Key
+		sess = &Session{UUID: user_uuid, SessionKey: sessionKey}
+		if err := sess.save(sessionFile); err != nil {
+			logger.Warning("Could not save session file %s: %v", sessionFile, err)
+		}
 	}
 	var bo backoff.BackOff = &backoff.ExponentialBackOff{
 		InitialInterval:     backoffInitial,
@@ -371,7 +432,42 @@ func Tunnels(ctx context.Context,
 	err = backoff.RetryNotify(func() error {
 		ctx1, cancel := context.WithTimeout(ctx, timeout)
 		defer cancel()
-		res, reterr = zgettunnels(ctx1, client, user_uuid, initres.Key, extVer, country, proxy_type, limit)
+		res, reterr = zgettunnels(ctx1, client, user_uuid, sessionKey, extVer, country, proxy_type, limit)
+		if errors.Is(reterr, PermanentBanError) {
+			// The persisted session is poisoned - drop it so the next run
+			// does not validate and reuse it.
+			if sessionFile != "" {
+				os.Remove(sessionFile)
+			}
+			return backoff.Permanent(reterr)
+		}
+		if errors.Is(reterr, TemporaryBanError) && reused {
+			// The stored session turned out to be stale despite passing
+			// (or skipping) validation - re-register once and let backoff
+			// retry zgettunnels with the fresh credentials.
+			reused = false
+			u := uuid.New()
+			newUUID := hex.EncodeToString(u[:])
+			ctx2, cancel2 := context.WithTimeout(ctx, timeout)
+			initres, ierr := background_init(ctx2, client, extVer, newUUID)
+			cancel2()
+			if ierr != nil {
+				if errors.Is(ierr, PermanentBanError) {
+					if sessionFile != "" {
+						os.Remove(sessionFile)
+					}
+					return backoff.Permanent(ierr)
+				}
+				logger.Warning("Re-registration after stale session failed: %v", ierr)
+				return reterr
+			}
+			user_uuid, sessionKey = newUUID, initres.Key
+			logger.Info("Stored session rejected upstream; registered a new one")
+			sess = &Session{UUID: user_uuid, SessionKey: sessionKey}
+			if err := sess.save(sessionFile); err != nil {
+				logger.Warning("Could not save session file %s: %v", sessionFile, err)
+			}
+		}
 		return reterr
 	}, bo, func(err error, dur time.Duration) {
 		logger.Info("zgettunnels error: %v; will retry after %v", err, dur.Truncate(time.Millisecond))

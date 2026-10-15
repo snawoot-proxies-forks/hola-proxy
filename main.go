@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -103,9 +104,17 @@ type CLIArgs struct {
 	initRetryInterval                       time.Duration
 	hideSNI                                 bool
 	userAgent                               *string
+	sessionFile                             string
 }
 
 func parse_args() *CLIArgs {
+	// Without a home directory, disable session persistence rather than
+	// writing .hola_session.json into the current working directory.
+	home, _ := os.UserHomeDir()
+	defaultSessionFile := ""
+	if home != "" {
+		defaultSessionFile = filepath.Join(home, ".hola_session.json")
+	}
 	args := &CLIArgs{
 		resolver: &CSVArg{
 			values: []string{
@@ -156,6 +165,9 @@ func parse_args() *CLIArgs {
 			return nil
 		})
 	flag.BoolVar(&args.hideSNI, "hide-SNI", true, "hide SNI in TLS sessions with proxy server")
+	flag.StringVar(&args.sessionFile, "session-file", defaultSessionFile,
+		"file to persist the Hola session ({uuid, sessionKey}) for reuse across restarts. "+
+			"Shared with python-hola. Empty string disables session persistence")
 	flag.Parse()
 	if args.country == "" {
 		arg_fail("Country can't be empty string.")
@@ -293,7 +305,7 @@ func run() int {
 	}
 	if args.list_proxies {
 		return print_proxies(try, mainLogger, args.extVer, args.country, args.proxy_type, args.limit, args.timeout,
-			args.backoffInitial, args.backoffDeadline)
+			args.backoffInitial, args.backoffDeadline, args.sessionFile)
 	}
 
 	mainLogger.Info("Constructing fallback DNS upstream...")
@@ -309,7 +321,7 @@ func run() int {
 	)
 	err = try("run credentials service", func() error {
 		auth, tunnels, err = CredService(args.rotate, args.timeout, args.extVer, args.country,
-			args.proxy_type, credLogger, args.backoffInitial, args.backoffDeadline)
+			args.proxy_type, credLogger, args.backoffInitial, args.backoffDeadline, args.sessionFile)
 		return err
 	})
 	if err != nil {
