@@ -80,6 +80,8 @@ type ZGetTunnelsResponse struct {
 	Protocol   map[string]string   `json:"protocol"`
 	Vendor     map[string]string   `json:"vendor"`
 	Ztun       map[string][]string `json:"ztun"`
+	Blocked    bool                `json:"blocked,omitempty"`
+	Permanent  bool                `json:"permanent,omitempty"`
 }
 
 type FallbackAgent struct {
@@ -269,6 +271,12 @@ func zgettunnels(ctx context.Context,
 	if err != nil {
 		return nil, fmt.Errorf("unable to unmashal zgettunnels response: %w", err)
 	}
+	if tunnels.Blocked {
+		if tunnels.Permanent {
+			return nil, PermanentBanError
+		}
+		return nil, TemporaryBanError
+	}
 	if len(tunnels.IPList) == 0 {
 		return nil, EmptyResponseError
 	}
@@ -372,6 +380,9 @@ func Tunnels(ctx context.Context,
 		ctx1, cancel := context.WithTimeout(ctx, timeout)
 		defer cancel()
 		res, reterr = zgettunnels(ctx1, client, user_uuid, initres.Key, extVer, country, proxy_type, limit)
+		if errors.Is(reterr, PermanentBanError) {
+			return backoff.Permanent(reterr)
+		}
 		return reterr
 	}, bo, func(err error, dur time.Duration) {
 		logger.Info("zgettunnels error: %v; will retry after %v", err, dur.Truncate(time.Millisecond))
@@ -463,12 +474,21 @@ func httpClientWithProxy(agent *FallbackAgent) *http.Client {
 	}
 }
 
-func EnsureTransaction(ctx context.Context, getFBTimeout time.Duration, txn func(context.Context, *http.Client) bool) (bool, error) {
+// EnsureTransaction runs txn against the base proxy first and then against
+// each fallback agent until one succeeds. It returns nil on success, the last
+// txn error when every attempt failed, or the fallback config fetch error.
+// A permanent ban aborts the whole loop immediately instead of running one
+// background_init per fallback agent against a banned IP.
+func EnsureTransaction(ctx context.Context, getFBTimeout time.Duration, txn func(context.Context, *http.Client) error) error {
 	client := httpClientWithProxy(nil)
 	defer client.CloseIdleConnections()
 
-	if txn(ctx, client) {
-		return true, nil
+	lastErr := txn(ctx, client)
+	if lastErr == nil {
+		return nil
+	}
+	if errors.Is(lastErr, PermanentBanError) {
+		return lastErr
 	}
 
 	// Fallback needed
@@ -476,18 +496,23 @@ func EnsureTransaction(ctx context.Context, getFBTimeout time.Duration, txn func
 	defer cancel()
 	fbc, err := GetFallbackProxies(getFBCtx)
 	if err != nil {
-		return false, err
+		return err
 	}
 
 	for _, agent := range fbc.Agents {
 		client = httpClientWithProxy(&agent)
 		defer client.CloseIdleConnections()
-		if txn(ctx, client) {
-			return true, nil
+		err := txn(ctx, client)
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if errors.Is(err, PermanentBanError) {
+			return err
 		}
 	}
 
-	return false, nil
+	return lastErr
 }
 
 func TemplateLogin(user_uuid string) string {

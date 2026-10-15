@@ -110,25 +110,20 @@ func print_countries(try func(string, func() error) error, timeout time.Duration
 	var (
 		countries CountryList
 		err       error
-		tx_res    bool
 		tx_err    error
 	)
 	err = try("list VPN countries", func() error {
-		tx_res, tx_err = EnsureTransaction(context.Background(), timeout, func(ctx context.Context, client *http.Client) bool {
+		tx_err = EnsureTransaction(context.Background(), timeout, func(ctx context.Context, client *http.Client) error {
 			ctx1, cancel := context.WithTimeout(ctx, timeout)
 			defer cancel()
 			countries, err = VPNCountries(ctx1, client)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Transaction error: %v. Retrying with the fallback mechanism...\n", err)
-				return false
 			}
-			return true
+			return err
 		})
 		if tx_err != nil {
-			return fmt.Errorf("transaction recovery mechanism failure: %v", err)
-		}
-		if !tx_res {
-			return errors.New("all fallback proxies failed.")
+			return fmt.Errorf("transaction recovery mechanism failure: %v", tx_err)
 		}
 		return nil
 	})
@@ -148,23 +143,18 @@ func print_proxies(try func(string, func() error) error, logger *CondLogger, ext
 		tunnels   *ZGetTunnelsResponse
 		user_uuid string
 		err       error
-		tx_res    bool
 		tx_err    error
 	)
 	err = try("list proxies", func() error {
-		tx_res, tx_err = EnsureTransaction(context.Background(), timeout, func(ctx context.Context, client *http.Client) bool {
+		tx_err = EnsureTransaction(context.Background(), timeout, func(ctx context.Context, client *http.Client) error {
 			tunnels, user_uuid, err = Tunnels(ctx, logger, client, extVer, country, proxy_type, limit, timeout, backoffInitial, backoffDeadline)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Transaction error: %v. Retrying with the fallback mechanism...\n", err)
-				return false
 			}
-			return true
+			return err
 		})
 		if tx_err != nil {
-			return fmt.Errorf("transaction recovery mechanism failure: %v", err)
-		}
-		if !tx_res {
-			return errors.New("all fallback proxies failed.")
+			return fmt.Errorf("transaction recovery mechanism failure: %v", tx_err)
 		}
 		return nil
 	})

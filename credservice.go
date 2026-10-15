@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"sync"
 	"time"
@@ -25,22 +26,17 @@ func CredService(interval, timeout time.Duration,
 		return auth_header
 	}
 
-	tx_res, tx_err := EnsureTransaction(context.Background(), timeout, func(ctx context.Context, client *http.Client) bool {
+	tx_err := EnsureTransaction(context.Background(), timeout, func(ctx context.Context, client *http.Client) error {
 		tunnels, user_uuid, err = Tunnels(ctx, logger, client, extVer, country, proxytype,
 			DEFAULT_LIST_LIMIT, timeout, backoffInitial, backoffDeadline)
 		if err != nil {
 			logger.Error("Configuration bootstrap error: %v. Retrying with the fallback mechanism...", err)
-			return false
 		}
-		return true
+		return err
 	})
 	if tx_err != nil {
 		logger.Critical("Transaction recovery mechanism failure: %v", tx_err)
 		err = tx_err
-		return
-	}
-	if !tx_res {
-		logger.Critical("All attempts failed.")
 		return
 	}
 	auth_header = basic_auth_header(TemplateLogin(user_uuid), tunnels.AgentKey)
@@ -58,22 +54,21 @@ func CredService(interval, timeout time.Duration,
 		for {
 			<-ticker.C
 			logger.Info("Rotating credentials...")
-			tx_res, tx_err := EnsureTransaction(context.Background(), timeout, func(ctx context.Context, client *http.Client) bool {
+			tx_err := EnsureTransaction(context.Background(), timeout, func(ctx context.Context, client *http.Client) error {
 				tuns, user_uuid, err = Tunnels(ctx, logger, client, extVer, country, proxytype,
 					DEFAULT_LIST_LIMIT, timeout, backoffInitial, backoffDeadline)
 				if err != nil {
 					logger.Error("Credential rotation error: %v. Retrying with the fallback mechanism...", err)
-					return false
 				}
-				return true
+				return err
 			})
 			if tx_err != nil {
 				logger.Critical("Transaction recovery mechanism failure: %v", tx_err)
-				err = tx_err
-				continue
-			}
-			if !tx_res {
-				logger.Critical("All rotation attempts failed.")
+				if errors.Is(tx_err, PermanentBanError) {
+					// Stop rotating: each retry would only re-register
+					// into the same ban.
+					return
+				}
 				continue
 			}
 			mux.Lock()
