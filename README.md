@@ -108,7 +108,7 @@ Also it is possible to export proxy addresses and credentials:
 $ ./hola-proxy -country de -list-proxies -limit 3
 Login: user-uuid-0a67c797b3214cbdb432b089c4b801cd
 Password: cd123c465901
-Proxy-Authorization: basic dXNlci11dWlkLTBhNjdjNzk3YjMyMTRjYmRiNDMyYjA4OWM0YjgwMWNkOmNkMTIzYzQ2NTkwMQ==
+Proxy-Authorization: Basic dXNlci11dWlkLTBhNjdjNzk3YjMyMTRjYmRiNDMyYjA4OWM0YjgwMWNkOmNkMTIzYzQ2NTkwMQ==
 
 host,ip_address,direct,peer,hola,trial,trial_peer,vendor
 zagent783.hola.org,165.22.22.6,22222,22223,22224,22225,22226,digitalocean

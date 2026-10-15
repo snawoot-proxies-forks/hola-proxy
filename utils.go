@@ -46,7 +46,7 @@ func (e *Endpoint) NetAddr() string {
 }
 
 func basic_auth_header(login, password string) string {
-	return "basic " + base64.StdEncoding.EncodeToString(
+	return "Basic " + base64.StdEncoding.EncodeToString(
 		[]byte(login+":"+password))
 }
 
