@@ -103,6 +103,7 @@ type CLIArgs struct {
 	initRetryInterval                       time.Duration
 	hideSNI                                 bool
 	userAgent                               *string
+	proxyAuth                               string
 }
 
 func parse_args() *CLIArgs {
@@ -156,6 +157,8 @@ func parse_args() *CLIArgs {
 			return nil
 		})
 	flag.BoolVar(&args.hideSNI, "hide-SNI", true, "hide SNI in TLS sessions with proxy server")
+	flag.StringVar(&args.proxyAuth, "proxy-auth", "", "require authentication on the local "+
+		"proxy listener, format: user:password")
 	flag.Parse()
 	if args.country == "" {
 		arg_fail("Country can't be empty string.")
@@ -324,7 +327,7 @@ func run() int {
 	requestDialer := NewPlaintextDialer(endpoint.NetAddr(), endpoint.TLSName, caPool, args.hideSNI, dialer)
 	mainLogger.Info("Endpoint: %s", endpoint.URL().String())
 	mainLogger.Info("Starting proxy server...")
-	handler := NewProxyHandler(handlerDialer, requestDialer, auth, resolver, proxyLogger)
+	handler := NewProxyHandler(handlerDialer, requestDialer, auth, args.proxyAuth, resolver, proxyLogger)
 	mainLogger.Info("Init complete.")
 	err = http.ListenAndServe(args.bind_address, handler)
 	mainLogger.Critical("Server terminated with a reason: %v", err)

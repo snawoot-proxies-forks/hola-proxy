@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/subtle"
+	"encoding/base64"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -13,13 +15,14 @@ const BAD_REQ_MSG = "Bad Request\n"
 type AuthProvider func() string
 
 type ProxyHandler struct {
-	logger        *CondLogger
-	dialer        ContextDialer
-	httptransport http.RoundTripper
-	auth          AuthProvider
+	logger         *CondLogger
+	dialer         ContextDialer
+	httptransport  http.RoundTripper
+	auth           AuthProvider
+	localAuthToken string
 }
 
-func NewProxyHandler(dialer, requestDialer ContextDialer, auth AuthProvider, resolver LookupNetIPer, logger *CondLogger) *ProxyHandler {
+func NewProxyHandler(dialer, requestDialer ContextDialer, auth AuthProvider, localAuth string, resolver LookupNetIPer, logger *CondLogger) *ProxyHandler {
 	dialer = NewRetryDialer(dialer, resolver, logger)
 	httptransport := &http.Transport{
 		Proxy: func(_ *http.Request) (*url.URL, error) {
@@ -34,12 +37,16 @@ func NewProxyHandler(dialer, requestDialer ContextDialer, auth AuthProvider, res
 		ExpectContinueTimeout: 1 * time.Second,
 		DialContext:           requestDialer.DialContext,
 	}
-	return &ProxyHandler{
+	h := &ProxyHandler{
 		logger:        logger,
 		dialer:        dialer,
 		auth:          auth,
 		httptransport: httptransport,
 	}
+	if localAuth != "" {
+		h.localAuthToken = base64.StdEncoding.EncodeToString([]byte(localAuth))
+	}
+	return h
 }
 
 func (s *ProxyHandler) HandleTunnel(wr http.ResponseWriter, req *http.Request) {
@@ -84,7 +91,9 @@ func (s *ProxyHandler) HandleRequest(wr http.ResponseWriter, req *http.Request) 
 		req.URL.Host = req.Host
 	}
 	delHopHeaders(req.Header)
-	req.Header.Add("Proxy-Authorization", s.auth())
+	// Never forward client-supplied credentials upstream; install ours instead.
+	req.Header.Del("Proxy-Authorization")
+	req.Header.Set("Proxy-Authorization", s.auth())
 	resp, err := s.httptransport.RoundTrip(req)
 	if err != nil {
 		s.logger.Error("HTTP fetch error: %v", err)
@@ -102,6 +111,21 @@ func (s *ProxyHandler) HandleRequest(wr http.ResponseWriter, req *http.Request) 
 
 func (s *ProxyHandler) ServeHTTP(wr http.ResponseWriter, req *http.Request) {
 	s.logger.Info("Request: %v %v %v %v", req.RemoteAddr, req.Proto, req.Method, req.URL)
+
+	if s.localAuthToken != "" {
+		credsOK := false
+		if pa := req.Header.Get("Proxy-Authorization"); pa != "" {
+			if f := strings.Fields(pa); len(f) == 2 && strings.EqualFold(f[0], "Basic") &&
+				subtle.ConstantTimeCompare([]byte(f[1]), []byte(s.localAuthToken)) == 1 {
+				credsOK = true
+			}
+		}
+		if !credsOK {
+			wr.Header().Set("Proxy-Authenticate", `Basic realm="hola-proxy"`)
+			http.Error(wr, "Proxy Authentication Required", http.StatusProxyAuthRequired)
+			return
+		}
+	}
 
 	isConnect := strings.ToUpper(req.Method) == "CONNECT"
 	if (req.URL.Host == "" || req.URL.Scheme == "" && !isConnect) && req.ProtoMajor < 2 ||
