@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -22,9 +23,10 @@ import (
 const COPY_BUF = 128 * 1024
 
 type Endpoint struct {
-	Host    string
-	Port    uint16
-	TLSName string
+	Host     string
+	Port     uint16
+	TLSName  string
+	ExpectIP string
 }
 
 func (e *Endpoint) URL() *url.URL {
@@ -135,10 +137,26 @@ func print_countries(try func(string, func() error) error, timeout time.Duration
 	if err != nil {
 		return 3
 	}
-	for _, code := range countries {
+	for _, code := range mergeCountries(countries) {
 		fmt.Printf("%v - %v\n", code, ISO3166[strings.ToUpper(code)])
 	}
 	return 0
+}
+
+// mergeCountries merges the vpn_countries.json response with
+// EXTRA_COUNTRIES (the upstream list is known to be incomplete) and returns
+// a sorted, deduplicated list.
+func mergeCountries(list CountryList) CountryList {
+	merged := append(CountryList{}, list...)
+	merged = append(merged, EXTRA_COUNTRIES...)
+	sort.Strings(merged)
+	out := merged[:0]
+	for i, c := range merged {
+		if i == 0 || c != merged[i-1] {
+			out = append(out, c)
+		}
+	}
+	return out
 }
 
 func print_proxies(try func(string, func() error) error, logger *CondLogger, extVer, country string, proxy_type string,
@@ -180,8 +198,16 @@ func print_proxies(try func(string, func() error) error, logger *CondLogger, ext
 		basic_auth_header(login, password))
 	fmt.Println("")
 	wr.Write([]string{"host", "ip_address", "direct", "peer", "hola", "trial", "trial_peer", "vendor"})
-	for host, ip := range tunnels.IPList {
-		if PROTOCOL_WHITELIST[tunnels.Protocol[host]] {
+	hosts := make([]string, 0, len(tunnels.IPList))
+	for host := range tunnels.IPList {
+		hosts = append(hosts, host)
+	}
+	sort.Strings(hosts)
+	for _, host := range hosts {
+		ip := tunnels.IPList[host]
+		// Match get_endpoints: keep hosts with no protocol entry, filter
+		// only explicitly non-whitelisted ones.
+		if p, ok := tunnels.Protocol[host]; !ok || PROTOCOL_WHITELIST[p] {
 			wr.Write([]string{host,
 				ip,
 				strconv.FormatUint(uint64(tunnels.Port.Direct), 10),
@@ -196,49 +222,112 @@ func print_proxies(try func(string, func() error) error, logger *CondLogger, ext
 	return 0
 }
 
-func get_endpoint(tunnels *ZGetTunnelsResponse, typ string, trial bool, force_port_field string) (*Endpoint, error) {
-	var hostname, ip string
-	for k, v := range tunnels.IPList {
-		hostname = k
-		ip = v
-		break
+func resolvePort(typ string, trial bool, force_port_field string, portMap PortMap) (uint16, error) {
+	if force_port_field != "" {
+		if p, err := strconv.ParseUint(force_port_field, 0, 16); err == nil {
+			return uint16(p), nil
+		}
+		typ = force_port_field
 	}
-	if hostname == "" || ip == "" {
+	switch typ {
+	case "direct", "lum", "pool", "virt":
+		if !trial {
+			return portMap.Trial, nil
+		}
+		return portMap.Direct, nil
+	case "peer":
+		if !trial {
+			return portMap.TrialPeer, nil
+		}
+		return portMap.Peer, nil
+	case "skip":
+		return 0, nil
+	default:
+		return 0, errors.New("Unsupported port type")
+	}
+}
+
+// get_endpoints enumerates candidate tunnel endpoints deterministically:
+// ztun entries in sorted country-key order (each entry keeps its protocol
+// whitelist and ip_list resolution), then ip_list hosts not covered by
+// ztun. Host dials the resolved IP while TLSName keeps the zagent hostname
+// for SNI/certificate verification; ExpectIP is the advertised egress IP.
+func get_endpoints(tunnels *ZGetTunnelsResponse, typ string, trial bool, force_port_field string) ([]*Endpoint, error) {
+	port, err := resolvePort(typ, trial, force_port_field, tunnels.Port)
+	if err != nil {
+		return nil, err
+	}
+	keys := make([]string, 0, len(tunnels.Ztun))
+	for k := range tunnels.Ztun {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	seen := make(map[string]bool)
+	var endpoints []*Endpoint
+	for _, k := range keys {
+		for _, entry := range tunnels.Ztun[k] {
+			// ztun entries may carry a scheme prefix like "HTTP host:port"
+			fields := strings.Fields(entry)
+			if len(fields) == 0 {
+				continue
+			}
+			host, _, serr := net.SplitHostPort(fields[len(fields)-1])
+			if serr != nil || host == "" || seen[host] {
+				continue
+			}
+			seen[host] = true
+			if p, ok := tunnels.Protocol[host]; ok && !PROTOCOL_WHITELIST[p] {
+				continue
+			}
+			ip := tunnels.IPList[host]
+			dialHost := ip
+			if dialHost == "" {
+				dialHost = host
+			}
+			endpoints = append(endpoints, &Endpoint{
+				Host:     dialHost,
+				Port:     port,
+				TLSName:  host,
+				ExpectIP: ip,
+			})
+		}
+	}
+	if len(endpoints) == 0 {
+		// Fall back to ip_list entries not covered by ztun.
+		hkeys := make([]string, 0, len(tunnels.IPList))
+		for host := range tunnels.IPList {
+			hkeys = append(hkeys, host)
+		}
+		sort.Strings(hkeys)
+		for _, host := range hkeys {
+			ip := tunnels.IPList[host]
+			if ip == "" || seen[host] {
+				continue
+			}
+			if p, ok := tunnels.Protocol[host]; ok && !PROTOCOL_WHITELIST[p] {
+				continue
+			}
+			seen[host] = true
+			endpoints = append(endpoints, &Endpoint{
+				Host:     ip,
+				Port:     port,
+				TLSName:  host,
+				ExpectIP: ip,
+			})
+		}
+	}
+	return endpoints, nil
+}
+
+func get_endpoint(tunnels *ZGetTunnelsResponse, typ string, trial bool, force_port_field string) (*Endpoint, error) {
+	endpoints, err := get_endpoints(tunnels, typ, trial, force_port_field)
+	if err != nil {
+		return nil, err
+	}
+	if len(endpoints) == 0 {
 		return nil, errors.New("No tunnels found in API response")
 	}
-
-	var port uint16
-	if force_port_field != "" {
-		port2, err := strconv.ParseUint(force_port_field, 0, 16)
-		if err == nil {
-			port = (uint16)(port2)
-			typ = "skip"
-		} else {
-			typ = force_port_field
-		}
-	}
-	if typ != "skip" {
-		if typ == "direct" || typ == "lum" || typ == "pool" || typ == "virt" {
-			if !trial {
-				port = tunnels.Port.Trial
-			} else {
-				port = tunnels.Port.Direct
-			}
-		} else if typ == "peer" {
-			if !trial {
-				port = tunnels.Port.TrialPeer
-			} else {
-				port = tunnels.Port.Peer
-			}
-		} else {
-			return nil, errors.New("Unsupported port type")
-		}
-	}
-	return &Endpoint{
-		Host:    ip,
-		Port:    port,
-		TLSName: hostname,
-	}, nil
+	return endpoints[0], nil
 }
 
 // Hop-by-hop headers. These are removed when sent to the backend.

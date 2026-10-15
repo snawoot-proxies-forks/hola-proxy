@@ -322,7 +322,7 @@ func run() int {
 	}
 	handlerDialer := NewProxyDialer(endpoint.NetAddr(), endpoint.TLSName, caPool, auth, args.hideSNI, dialer)
 	requestDialer := NewPlaintextDialer(endpoint.NetAddr(), endpoint.TLSName, caPool, args.hideSNI, dialer)
-	mainLogger.Info("Endpoint: %s", endpoint.URL().String())
+	mainLogger.Info("Endpoint: %s (dial %s)", endpoint.URL().String(), endpoint.NetAddr())
 	mainLogger.Info("Starting proxy server...")
 	handler := NewProxyHandler(handlerDialer, requestDialer, auth, resolver, proxyLogger)
 	mainLogger.Info("Init complete.")

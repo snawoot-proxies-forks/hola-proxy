@@ -252,3 +252,9 @@ func init() {
 		"ZZ": "Unknown or unspecified country",
 	}
 }
+
+// EXTRA_COUNTRIES are merged into -list-countries output on top of the
+// vpn_countries.json response, which is known to be incomplete.
+var EXTRA_COUNTRIES = CountryList{
+	"bo", "cn", "ge", "gi", "kw", "md", "py", "sh", "uy", "ve",
+}
