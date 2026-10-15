@@ -62,7 +62,7 @@ func (d *PlaintextDialer) DialContext(ctx context.Context, network, address stri
 				_, err := cs.PeerCertificates[0].Verify(opts)
 				return err
 			},
-		}, tls.HelloAndroid_11_OkHttp)
+		}, tls.HelloChrome_Auto)
 		if err := tlsConn.HandshakeContext(ctx); err != nil {
 			conn.Close()
 			return nil, err

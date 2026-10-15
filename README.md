@@ -19,6 +19,7 @@ This alternative implementation ensures your internet connection is not shared w
 * Uses TLS for secure communication with upstream proxies
 * Zero configuration
 * Simple and straight forward
+* Browser-grade fingerprinting for Hola API requests via [CycleTLS](https://github.com/Danny-Dasilva/CycleTLS) (Chrome JA3/HTTP2 fingerprint, header order, extension `Origin`) and `utls` Chrome ClientHello for zagent tunnels
 
 ## Installation
 

@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"net/http"
 	"sync"
 	"time"
 )
@@ -16,6 +15,7 @@ func CredService(interval, timeout time.Duration,
 	logger *CondLogger,
 	backoffInitial time.Duration,
 	backoffDeadline time.Duration,
+	baseProxy string,
 ) (auth AuthProvider, tunnels *ZGetTunnelsResponse, err error) {
 	var mux sync.Mutex
 	var auth_header, user_uuid string
@@ -25,22 +25,19 @@ func CredService(interval, timeout time.Duration,
 		return auth_header
 	}
 
-	tx_res, tx_err := EnsureTransaction(context.Background(), timeout, func(ctx context.Context, client *http.Client) bool {
-		tunnels, user_uuid, err = Tunnels(ctx, logger, client, extVer, country, proxytype,
+	tx_err := EnsureTransaction(context.Background(), timeout, baseProxy, func(ctx context.Context, purl string) error {
+		tuns, uuidRes, terr := Tunnels(ctx, logger, purl, extVer, country, proxytype,
 			DEFAULT_LIST_LIMIT, timeout, backoffInitial, backoffDeadline)
-		if err != nil {
-			logger.Error("Configuration bootstrap error: %v. Retrying with the fallback mechanism...", err)
-			return false
+		if terr != nil {
+			logger.Error("Configuration bootstrap error: %v. Retrying with the fallback mechanism...", terr)
+			return terr
 		}
-		return true
+		tunnels, user_uuid = tuns, uuidRes
+		return nil
 	})
 	if tx_err != nil {
 		logger.Critical("Transaction recovery mechanism failure: %v", tx_err)
 		err = tx_err
-		return
-	}
-	if !tx_res {
-		logger.Critical("All attempts failed.")
 		return
 	}
 	auth_header = basic_auth_header(TemplateLogin(user_uuid), tunnels.AgentKey)
@@ -58,22 +55,17 @@ func CredService(interval, timeout time.Duration,
 		for {
 			<-ticker.C
 			logger.Info("Rotating credentials...")
-			tx_res, tx_err := EnsureTransaction(context.Background(), timeout, func(ctx context.Context, client *http.Client) bool {
-				tuns, user_uuid, err = Tunnels(ctx, logger, client, extVer, country, proxytype,
+			tx_err := EnsureTransaction(context.Background(), timeout, baseProxy, func(ctx context.Context, purl string) error {
+				tuns, user_uuid, err = Tunnels(ctx, logger, purl, extVer, country, proxytype,
 					DEFAULT_LIST_LIMIT, timeout, backoffInitial, backoffDeadline)
 				if err != nil {
 					logger.Error("Credential rotation error: %v. Retrying with the fallback mechanism...", err)
-					return false
 				}
-				return true
+				return err
 			})
 			if tx_err != nil {
 				logger.Critical("Transaction recovery mechanism failure: %v", tx_err)
 				err = tx_err
-				continue
-			}
-			if !tx_res {
-				logger.Critical("All rotation attempts failed.")
 				continue
 			}
 			mux.Lock()

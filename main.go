@@ -18,7 +18,6 @@ import (
 	"strings"
 	"time"
 
-	tls "github.com/refraction-networking/utls"
 	xproxy "golang.org/x/net/proxy"
 )
 
@@ -29,6 +28,7 @@ const (
 var (
 	PROTOCOL_WHITELIST map[string]bool
 	version            = "undefined"
+	caPool             *x509.CertPool
 )
 
 func init() {
@@ -194,7 +194,6 @@ func run() int {
 		KeepAlive: 30 * time.Second,
 	}
 
-	var caPool *x509.CertPool
 	if args.caFile != "" {
 		caPool = x509.NewCertPool()
 		certs, err := ioutil.ReadFile(args.caFile)
@@ -206,9 +205,6 @@ func run() int {
 			mainLogger.Error("Can't load certificates from CA file")
 			return 15
 		}
-		UpdateHolaTLSConfig(&tls.Config{
-			RootCAs: caPool,
-		})
 	}
 	SetHideSNI(args.hideSNI)
 
@@ -235,14 +231,13 @@ func run() int {
 			return 7
 		}
 		dialer = pxDialer.(ContextDialer)
-		UpdateHolaDialer(dialer)
 	}
+	// API requests routed through https:// proxies (fallback agents or the
+	// user's -proxy) use this as the underlying connection.
+	baseDialer = dialer
+	baseProxyURL = args.proxy
 
 	try := retryPolicy(args.initRetries, args.initRetryInterval, mainLogger)
-
-	if args.list_countries {
-		return print_countries(try, args.timeout)
-	}
 
 	mainLogger.Info("hola-proxy client version %s is starting...", version)
 
@@ -291,9 +286,12 @@ func run() int {
 		}
 		mainLogger.Warning("Detected latest extension version: %q. Pass -ext-ver parameter to skip resolve and speedup startup", args.extVer)
 	}
+	if args.list_countries {
+		return print_countries(try, args.timeout, args.extVer, args.proxy)
+	}
 	if args.list_proxies {
 		return print_proxies(try, mainLogger, args.extVer, args.country, args.proxy_type, args.limit, args.timeout,
-			args.backoffInitial, args.backoffDeadline)
+			args.backoffInitial, args.backoffDeadline, args.proxy)
 	}
 
 	mainLogger.Info("Constructing fallback DNS upstream...")
@@ -309,7 +307,7 @@ func run() int {
 	)
 	err = try("run credentials service", func() error {
 		auth, tunnels, err = CredService(args.rotate, args.timeout, args.extVer, args.country,
-			args.proxy_type, credLogger, args.backoffInitial, args.backoffDeadline)
+			args.proxy_type, credLogger, args.backoffInitial, args.backoffDeadline, args.proxy)
 		return err
 	})
 	if err != nil {

@@ -3,13 +3,14 @@ package main
 import (
 	"bytes"
 	"context"
-	"crypto/x509"
+	stdtls "crypto/tls"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
+	"math"
 	"math/rand"
 	"net"
 	"net/http"
@@ -20,10 +21,12 @@ import (
 	"text/template"
 	"time"
 
+	cycletls "github.com/Danny-Dasilva/CycleTLS/cycletls"
 	"github.com/campoy/unique"
 	"github.com/cenkalti/backoff/v4"
 	"github.com/google/uuid"
 	tls "github.com/refraction-networking/utls"
+	"golang.org/x/net/http2"
 )
 
 const EXT_BROWSER = "chrome"
@@ -33,6 +36,26 @@ const VPN_COUNTRIES_URL = CCGI_URL + "vpn_countries.json"
 const BG_INIT_URL = CCGI_URL + "background_init"
 const ZGETTUNNELS_URL = CCGI_URL + "zgettunnels"
 const AGENT_SUFFIX = ".hola.org"
+
+// Mimic a real Chrome extension request as closely as possible.
+const EXT_ORIGIN = "chrome-extension://gkojfkhlekighikafcpjkiklfbnlmeio"
+const ACCEPT_LANGUAGE = "de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7"
+
+// ACCEPT_ENCODING advertises only encodings CycleTLS can transparently
+// decompress (gzip, deflate, br - no zstd support upstream).
+const ACCEPT_ENCODING = "gzip, deflate, br"
+
+var HEADER_ORDER = []string{
+	"host",
+	"connection",
+	"content-length",
+	"content-type",
+	"accept",
+	"origin",
+	"user-agent",
+	"accept-encoding",
+	"accept-language",
+}
 
 var FALLBACK_CONF_URLS = []string{
 	"https://www.dropbox.com/s/jemizcvpmf2qb9v/cloud_failover.conf?dl=1",
@@ -146,22 +169,120 @@ func (a *FallbackAgent) NetAddr() string {
 	return net.JoinHostPort(a.IP, fmt.Sprintf("%d", a.Port))
 }
 
-func do_req(ctx context.Context, client *http.Client, method, url string, query, data url.Values) ([]byte, error) {
-	var (
-		req *http.Request
-		err error
-	)
+var cclient = cycletls.Init()
+
+// directDialer makes plain TCP connections. baseDialer is the underlying
+// transport for API requests routed through an https:// proxy: main() replaces
+// it with the user's base proxy dialer when -proxy is set, so fallback agent
+// connections are still chained through it. baseProxyURL holds the -proxy
+// value so requests to the user's own proxy dial it directly instead of
+// chaining it through itself.
+var directDialer ContextDialer = &net.Dialer{
+	Timeout:   30 * time.Second,
+	KeepAlive: 30 * time.Second,
+}
+var baseDialer ContextDialer = directDialer
+var baseProxyURL string
+
+func commonParams(extVer string) url.Values {
+	params := make(url.Values)
+	params.Add("rmt_ver", extVer)
+	params.Add("ext_ver", extVer)
+	params.Add("browser", EXT_BROWSER)
+	params.Add("product", PRODUCT)
+	params.Add("lccgi", "1")
+	return params
+}
+
+func do_req(ctx context.Context, proxyURL, method, reqURL string, query, data url.Values) ([]byte, error) {
 	if method == "" {
 		method = "GET"
 	}
-	if data == nil {
-		req, err = http.NewRequestWithContext(ctx, method, url, nil)
-	} else {
-		req, err = http.NewRequestWithContext(ctx,
-			method,
-			url,
-			bytes.NewReader([]byte(data.Encode())))
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
+	if u, perr := url.Parse(proxyURL); perr == nil && strings.EqualFold(u.Scheme, "https") {
+		// CycleTLS dials https:// proxies with stock crypto/tls and
+		// InsecureSkipVerify - use our own verified utls path instead.
+		next := baseDialer
+		if proxyURL == baseProxyURL {
+			next = directDialer
+		}
+		return doReqViaHTTPSProxy(ctx, u, next, method, reqURL, query, data)
+	}
+	timeout := 35
+	if dl, ok := ctx.Deadline(); ok {
+		timeout = int(math.Ceil(time.Until(dl).Seconds()))
+		if timeout < 1 {
+			timeout = 1
+		}
+	}
+	if query != nil {
+		sep := "?"
+		if strings.Contains(reqURL, "?") {
+			sep = "&"
+		}
+		reqURL += sep + query.Encode()
+	}
+	opts := cycletls.Options{
+		URL:       reqURL,
+		UserAgent: userAgent,
+		Proxy:     proxyURL,
+		Timeout:   timeout,
+		// Follow redirects: the Dropbox fallback conf URL legitimately
+		// 302s to a CDN link.
+		DisableRedirect: false,
+		// CycleTLS caches connections per pooled client but never evicts
+		// dead ones, so reuse would wedge a long-running process on a
+		// stale connection.
+		EnableConnectionReuse: false,
+		HeaderOrder:           HEADER_ORDER,
+		Headers: map[string]string{
+			"Origin":          EXT_ORIGIN,
+			"Accept-Language": ACCEPT_LANGUAGE,
+			"Accept-Encoding": ACCEPT_ENCODING,
+		},
+	}
+	if data != nil {
+		opts.Body = data.Encode()
+		opts.Headers["Content-Type"] = "application/x-www-form-urlencoded"
+	}
+	resp, err := cclient.Do(reqURL, opts, method)
+	if err != nil {
+		return nil, err
+	}
+	if resp.Status < 200 || resp.Status > 204 {
+		// CycleTLS reports transport failures as a fake status with the
+		// real error text in the body - surface it for debugging.
+		const maxErrLen = 200
+		msg := resp.Body
+		if len(msg) > maxErrLen {
+			msg = msg[:maxErrLen] + "..."
+		}
+		return nil, fmt.Errorf("bad HTTP response: %d: %s", resp.Status, strings.TrimSpace(msg))
+	}
+	return []byte(resp.Body), nil
+}
+
+// doReqViaHTTPSProxy issues the API request through an https:// proxy using
+// ProxyDialer for the proxy hop (utls handshake with certificate verification
+// instead of CycleTLS's unverified stock-TLS connect) and a utls Chrome
+// ClientHello for the tunneled request itself.
+func doReqViaHTTPSProxy(ctx context.Context, proxy *url.URL, next ContextDialer, method, reqURL string, query, data url.Values) ([]byte, error) {
+	pd, err := ProxyDialerFromURL(proxy, caPool, next)
+	if err != nil {
+		return nil, err
+	}
+	// Hola agents worked with a suppressed SNI; for a user-supplied proxy the
+	// SNI may be required for vhost routing, so only hide it for *.hola.org.
+	if strings.HasSuffix(proxy.Hostname(), AGENT_SUFFIX) {
+		pd.hideSNI = hideSNI
+	}
+	var body io.Reader
+	if data != nil {
+		body = bytes.NewReader([]byte(data.Encode()))
+	}
+	req, err := http.NewRequestWithContext(ctx, method, reqURL, body)
 	if err != nil {
 		return nil, err
 	}
@@ -169,30 +290,67 @@ func do_req(ctx context.Context, client *http.Client, method, url string, query,
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	}
 	if query != nil {
-		req.URL.RawQuery = query.Encode()
+		// Append to any query already present in reqURL, matching the
+		// CycleTLS code path.
+		if req.URL.RawQuery != "" {
+			req.URL.RawQuery += "&" + query.Encode()
+		} else {
+			req.URL.RawQuery = query.Encode()
+		}
 	}
 	req.Header.Set("User-Agent", userAgent)
-	resp, err := client.Do(req)
+	req.Header.Set("Origin", EXT_ORIGIN)
+	req.Header.Set("Accept-Language", ACCEPT_LANGUAGE)
+	// No explicit Accept-Encoding: the transport advertises gzip itself and
+	// transparently decompresses only when it did so.
+	//
+	// Force HTTP/2 like the extension. A plain http.Transport cannot
+	// negotiate h2 over a utls conn (ConnectionState type differs from
+	// crypto/tls), so use http2.Transport with a custom dialer and fail
+	// the dial if the endpoint does not speak h2.
+	tr2 := &http2.Transport{
+		AllowHTTP: false,
+		DialTLSContext: func(ctx context.Context, network, addr string, _ *stdtls.Config) (net.Conn, error) {
+			conn, err := pd.DialContext(ctx, network, addr)
+			if err != nil {
+				return nil, err
+			}
+			host, _, err := net.SplitHostPort(addr)
+			if err != nil {
+				conn.Close()
+				return nil, fmt.Errorf("hostname extraction error: %w", err)
+			}
+			tlsConn := tls.UClient(conn, &tls.Config{
+				ServerName: host,
+				RootCAs:    caPool,
+				NextProtos: []string{"h2"},
+			}, tls.HelloChrome_Auto)
+			if err := tlsConn.HandshakeContext(ctx); err != nil {
+				conn.Close()
+				return nil, fmt.Errorf("UClient handshake failed: %w", err)
+			}
+			if tlsConn.ConnectionState().NegotiatedProtocol != "h2" {
+				tlsConn.Close()
+				return nil, errors.New("endpoint does not negotiate HTTP/2")
+			}
+			return tlsConn, nil
+		},
+	}
+	defer tr2.CloseIdleConnections()
+	resp, err := (&http.Client{Transport: tr2}).Do(req)
 	if err != nil {
 		return nil, err
 	}
-	switch resp.StatusCode {
-	case http.StatusOK, http.StatusCreated, http.StatusAccepted, http.StatusNoContent:
-	default:
-		return nil, errors.New(fmt.Sprintf("Bad HTTP response: %s", resp.Status))
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode > 204 {
+		return nil, fmt.Errorf("bad HTTP response: %s", resp.Status)
 	}
-	body, err := ioutil.ReadAll(resp.Body)
-	resp.Body.Close()
-	if err != nil {
-		return nil, err
-	}
-	return body, nil
+	return io.ReadAll(resp.Body)
 }
 
-func VPNCountries(ctx context.Context, client *http.Client) (res CountryList, err error) {
-	params := make(url.Values)
-	params.Add("browser", EXT_BROWSER)
-	data, err := do_req(ctx, client, "", VPN_COUNTRIES_URL, params, nil)
+func VPNCountries(ctx context.Context, proxyURL, extVer string) (res CountryList, err error) {
+	params := commonParams(extVer)
+	data, err := do_req(ctx, proxyURL, "", VPN_COUNTRIES_URL, params, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -207,13 +365,14 @@ func VPNCountries(ctx context.Context, client *http.Client) (res CountryList, er
 	return
 }
 
-func background_init(ctx context.Context, client *http.Client, extVer, user_uuid string) (res BgInitResponse, reterr error) {
+func background_init(ctx context.Context, proxyURL, extVer, user_uuid string) (res BgInitResponse, reterr error) {
 	post_data := make(url.Values)
 	post_data.Add("login", "1")
+	post_data.Add("flags", "0")
 	post_data.Add("ver", extVer)
-	qs := make(url.Values)
+	qs := commonParams(extVer)
 	qs.Add("uuid", user_uuid)
-	resp, err := do_req(ctx, client, "POST", BG_INIT_URL, qs, post_data)
+	resp, err := do_req(ctx, proxyURL, "POST", BG_INIT_URL, qs, post_data)
 	if err != nil {
 		reterr = err
 		return
@@ -231,7 +390,7 @@ func background_init(ctx context.Context, client *http.Client, extVer, user_uuid
 }
 
 func zgettunnels(ctx context.Context,
-	client *http.Client,
+	proxyURL string,
 	user_uuid string,
 	session_key int64,
 	extVer string,
@@ -239,7 +398,7 @@ func zgettunnels(ctx context.Context,
 	proxy_type string,
 	limit uint) (res *ZGetTunnelsResponse, reterr error) {
 	var tunnels ZGetTunnelsResponse
-	params := make(url.Values)
+	params := commonParams(extVer)
 	if proxy_type == "lum" {
 		params.Add("country", country+".pool_lum_"+country+"_shared")
 	} else if proxy_type == "virt" { // seems to be for brazil and japan only
@@ -254,13 +413,10 @@ func zgettunnels(ctx context.Context,
 	}
 	params.Add("limit", strconv.FormatInt(int64(limit), 10))
 	params.Add("ping_id", strconv.FormatFloat(rand.New(RandomSource).Float64(), 'f', -1, 64))
-	params.Add("ext_ver", extVer)
-	params.Add("browser", EXT_BROWSER)
-	params.Add("product", PRODUCT)
 	params.Add("uuid", user_uuid)
 	params.Add("session_key", strconv.FormatInt(session_key, 10))
 	params.Add("is_premium", "0")
-	data, err := do_req(ctx, client, "POST", ZGETTUNNELS_URL, params, nil)
+	data, err := do_req(ctx, proxyURL, "POST", ZGETTUNNELS_URL, params, nil)
 	if err != nil {
 		reterr = err
 		return
@@ -277,9 +433,8 @@ func zgettunnels(ctx context.Context,
 }
 
 func fetchFallbackConfig(ctx context.Context) (*FallbackConfig, error) {
-	client := httpClientWithProxy(nil)
 	fallbackConfURL := FALLBACK_CONF_URLS[rand.New(RandomSource).Intn(len(FALLBACK_CONF_URLS))]
-	confRaw, err := do_req(ctx, client, "", fallbackConfURL, nil, nil)
+	confRaw, err := do_req(ctx, "", "", fallbackConfURL, nil, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -340,7 +495,7 @@ func GetFallbackProxies(ctx context.Context) (*FallbackConfig, error) {
 
 func Tunnels(ctx context.Context,
 	logger *CondLogger,
-	client *http.Client,
+	proxyURL string,
 	extVer string,
 	country string,
 	proxy_type string,
@@ -352,8 +507,8 @@ func Tunnels(ctx context.Context,
 	u := uuid.New()
 	user_uuid = hex.EncodeToString(u[:])
 	ctx1, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-	initres, err := background_init(ctx1, client, extVer, user_uuid)
+	initres, err := background_init(ctx1, proxyURL, extVer, user_uuid)
+	cancel()
 	if err != nil {
 		reterr = err
 		return
@@ -371,7 +526,7 @@ func Tunnels(ctx context.Context,
 	err = backoff.RetryNotify(func() error {
 		ctx1, cancel := context.WithTimeout(ctx, timeout)
 		defer cancel()
-		res, reterr = zgettunnels(ctx1, client, user_uuid, initres.Key, extVer, country, proxy_type, limit)
+		res, reterr = zgettunnels(ctx1, proxyURL, user_uuid, initres.Key, extVer, country, proxy_type, limit)
 		return reterr
 	}, bo, func(err error, dur time.Duration) {
 		logger.Info("zgettunnels error: %v; will retry after %v", err, dur.Truncate(time.Millisecond))
@@ -383,92 +538,26 @@ func Tunnels(ctx context.Context,
 	return
 }
 
-var baseDialer ContextDialer = &net.Dialer{
-	Timeout:   30 * time.Second,
-	KeepAlive: 30 * time.Second,
-}
-
-var tlsConfig *tls.Config
-
-func UpdateHolaDialer(dialer ContextDialer) {
-	baseDialer = dialer
-}
-
-func UpdateHolaTLSConfig(config *tls.Config) {
-	tlsConfig = config
-}
-
 var hideSNI bool
 
 func SetHideSNI(hide bool) {
 	hideSNI = hide
 }
 
-// Returns default http client with a proxy override
-func httpClientWithProxy(agent *FallbackAgent) *http.Client {
-	t := &http.Transport{
-		ForceAttemptHTTP2:     true,
-		MaxIdleConns:          100,
-		IdleConnTimeout:       90 * time.Second,
-		ExpectContinueTimeout: 1 * time.Second,
-	}
-	var dialer ContextDialer = baseDialer
-	var rootCAs *x509.CertPool
-	if tlsConfig != nil {
-		rootCAs = tlsConfig.RootCAs
-	}
-	if agent != nil {
-		dialer = NewProxyDialer(agent.NetAddr(), agent.Hostname(), rootCAs, nil, true, dialer)
-	}
-	t.DialContext = dialer.DialContext
-	t.DialTLSContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-		host, _, err := net.SplitHostPort(addr)
-		if err != nil {
-			return nil, fmt.Errorf("hostname extraction error: %w", err)
+// EnsureTransaction runs txn against the base proxy first and then against
+// each fallback agent until one succeeds. It returns nil on success, the last
+// txn error when every attempt failed, or the fallback config fetch error.
+// Fatal errors (permanent ban) abort the whole loop immediately instead of
+// hammering the registration endpoint with one background_init per agent.
+func EnsureTransaction(ctx context.Context, getFBTimeout time.Duration, baseProxy string, txn func(context.Context, string) error) error {
+	var lastErr error
+	if err := txn(ctx, baseProxy); err == nil {
+		return nil
+	} else {
+		lastErr = err
+		if errors.Is(err, PermanentBanError) {
+			return err
 		}
-		conn, err := dialer.DialContext(ctx, network, addr)
-		if err != nil {
-			return nil, fmt.Errorf("can't prepare underlying connection for TLS session: %w", err)
-		}
-		var cfg tls.Config
-		if tlsConfig != nil {
-			cfg = *tlsConfig
-		}
-		if !hideSNI {
-			cfg.ServerName = host
-		} else {
-			cfg.InsecureSkipVerify = true
-			cfg.VerifyConnection = func(cs tls.ConnectionState) error {
-				opts := x509.VerifyOptions{
-					DNSName:       host,
-					Intermediates: x509.NewCertPool(),
-					Roots:         cfg.RootCAs,
-				}
-				for _, cert := range cs.PeerCertificates[1:] {
-					opts.Intermediates.AddCert(cert)
-				}
-				_, err := cs.PeerCertificates[0].Verify(opts)
-				return err
-			}
-		}
-		tlsConn := tls.UClient(conn, &cfg, tls.HelloAndroid_11_OkHttp)
-		if err := tlsConn.HandshakeContext(ctx); err != nil {
-			conn.Close()
-			return nil, fmt.Errorf("UClient handshake failed: %w", err)
-		}
-		return tlsConn, nil
-	}
-	return &http.Client{
-		Transport: t,
-	}
-}
-
-func EnsureTransaction(ctx context.Context, getFBTimeout time.Duration, txn func(context.Context, *http.Client) bool) (bool, error) {
-	client := httpClientWithProxy(nil)
-	defer client.CloseIdleConnections()
-
-	if txn(ctx, client) {
-		return true, nil
 	}
 
 	// Fallback needed
@@ -476,18 +565,21 @@ func EnsureTransaction(ctx context.Context, getFBTimeout time.Duration, txn func
 	defer cancel()
 	fbc, err := GetFallbackProxies(getFBCtx)
 	if err != nil {
-		return false, err
+		return err
 	}
 
 	for _, agent := range fbc.Agents {
-		client = httpClientWithProxy(&agent)
-		defer client.CloseIdleConnections()
-		if txn(ctx, client) {
-			return true, nil
+		if err := txn(ctx, agent.ToProxy().String()); err == nil {
+			return nil
+		} else {
+			lastErr = err
+			if errors.Is(err, PermanentBanError) {
+				return err
+			}
 		}
 	}
 
-	return false, nil
+	return lastErr
 }
 
 func TemplateLogin(user_uuid string) string {

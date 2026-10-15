@@ -106,29 +106,26 @@ func proxyh2(ctx context.Context, leftreader io.ReadCloser, leftwriter io.Writer
 	return
 }
 
-func print_countries(try func(string, func() error) error, timeout time.Duration) int {
+func print_countries(try func(string, func() error) error, timeout time.Duration, extVer, proxyURL string) int {
 	var (
 		countries CountryList
 		err       error
-		tx_res    bool
-		tx_err    error
 	)
 	err = try("list VPN countries", func() error {
-		tx_res, tx_err = EnsureTransaction(context.Background(), timeout, func(ctx context.Context, client *http.Client) bool {
+		tx_err := EnsureTransaction(context.Background(), timeout, proxyURL, func(ctx context.Context, purl string) error {
 			ctx1, cancel := context.WithTimeout(ctx, timeout)
 			defer cancel()
-			countries, err = VPNCountries(ctx1, client)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Transaction error: %v. Retrying with the fallback mechanism...\n", err)
-				return false
+			res, terr := VPNCountries(ctx1, purl, extVer)
+			if terr != nil {
+				fmt.Fprintf(os.Stderr, "Transaction error: %v. Retrying with the fallback mechanism...\n", terr)
+				return terr
 			}
-			return true
+			countries = res
+			return nil
 		})
 		if tx_err != nil {
-			return fmt.Errorf("transaction recovery mechanism failure: %v", err)
-		}
-		if !tx_res {
-			return errors.New("all fallback proxies failed.")
+			// %w keeps PermanentBanError detectable by retryPolicy.
+			return fmt.Errorf("transaction recovery mechanism failure: %w", tx_err)
 		}
 		return nil
 	})
@@ -142,29 +139,26 @@ func print_countries(try func(string, func() error) error, timeout time.Duration
 }
 
 func print_proxies(try func(string, func() error) error, logger *CondLogger, extVer, country string, proxy_type string,
-	limit uint, timeout time.Duration, backoffInitial time.Duration, backoffDeadline time.Duration,
+	limit uint, timeout time.Duration, backoffInitial time.Duration, backoffDeadline time.Duration, proxyURL string,
 ) int {
 	var (
 		tunnels   *ZGetTunnelsResponse
 		user_uuid string
 		err       error
-		tx_res    bool
-		tx_err    error
 	)
 	err = try("list proxies", func() error {
-		tx_res, tx_err = EnsureTransaction(context.Background(), timeout, func(ctx context.Context, client *http.Client) bool {
-			tunnels, user_uuid, err = Tunnels(ctx, logger, client, extVer, country, proxy_type, limit, timeout, backoffInitial, backoffDeadline)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Transaction error: %v. Retrying with the fallback mechanism...\n", err)
-				return false
+		tx_err := EnsureTransaction(context.Background(), timeout, proxyURL, func(ctx context.Context, purl string) error {
+			tuns, uuidRes, terr := Tunnels(ctx, logger, purl, extVer, country, proxy_type, limit, timeout, backoffInitial, backoffDeadline)
+			if terr != nil {
+				fmt.Fprintf(os.Stderr, "Transaction error: %v. Retrying with the fallback mechanism...\n", terr)
+				return terr
 			}
-			return true
+			tunnels, user_uuid = tuns, uuidRes
+			return nil
 		})
 		if tx_err != nil {
-			return fmt.Errorf("transaction recovery mechanism failure: %v", err)
-		}
-		if !tx_res {
-			return errors.New("all fallback proxies failed.")
+			// %w keeps PermanentBanError detectable by retryPolicy.
+			return fmt.Errorf("transaction recovery mechanism failure: %w", tx_err)
 		}
 		return nil
 	})
